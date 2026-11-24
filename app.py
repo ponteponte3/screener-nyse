@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import time
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
@@ -11,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("📈 AlphaPulse — Screener NYSE (EUR)")
-st.markdown("Strategia **Long Trend & Momentum** (`Prezzo > EMA9`, `RSI 50-68`, `Volume > Media 30g`) con calcolo automatico di Position Size, Stop Loss (ATR) e Take Profit in Euro.")
+st.markdown("Strategia **Long Trend & Momentum** (`Prezzo > EMA9`, `RSI`, `Volume`) con gestione automatica del rischio e conversione in Euro.")
 
 # --- RECUPERO CAMBIO EUR/USD LIVE ---
 @st.cache_data(ttl=3600)
@@ -38,7 +39,9 @@ rapporto_rr = st.sidebar.slider("Rapporto Rischio/Rendimento (R:R)", min_value=1
 moltiplicatore_atr = st.sidebar.slider("Moltiplicatore ATR (Stop Loss)", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
 
 st.sidebar.divider()
-st.sidebar.subheader("🔍 Filtri Mercato & Cambio")
+st.sidebar.subheader("🔍 Filtri Strategia & Liquidità")
+rsi_range = st.sidebar.slider("Range RSI (14g)", min_value=30, max_value=80, value=(50, 68))
+rel_vol_min = st.sidebar.slider("Volume Relativo Minimo (vs Media 30g)", min_value=0.5, max_value=2.0, value=1.0, step=0.1)
 prezzo_minimo_usd = st.sidebar.number_input("Prezzo Minimo Titolo ($)", min_value=1.0, value=5.0, step=1.0)
 volume_minimo = st.sidebar.number_input("Volume Medio Minimo (30g)", min_value=100000, value=500000, step=100000)
 cambio_eur_usd = st.sidebar.number_input("Tasso Cambio EUR/USD", min_value=0.5000, max_value=2.0000, value=cambio_default, step=0.0050, format="%.4f")
@@ -82,33 +85,47 @@ except FileNotFoundError:
 # --- AVVIO SCANSIONE ---
 if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container_width=True):
     candidati = []
+    scaricati_ok = 0
     capitale_usd = capitale_eur * cambio_eur_usd
     rischio_usd = capitale_usd * rischio_max_pct
     allocazione_max_usd = capitale_usd * allocazione_max_pct
 
     barra = st.progress(0, text="Inizializzazione scansione...")
     
-    batch_size = 100
+    batch_size = 50
     totale = len(tickers)
 
     for i in range(0, totale, batch_size):
         batch = tickers[i:i + batch_size]
         progresso = min((i + batch_size) / totale, 1.0)
-        barra.progress(progresso, text=f"Analisi in corso: {min(i + batch_size, totale)} / {totale} titoli... (Trovati: {len(candidati)})")
+        barra.progress(
+            progresso,
+            text=f"Analisi: {min(i + batch_size, totale)}/{totale} | Scaricati validi: {scaricati_ok} | Trovati: {len(candidati)}"
+        )
 
         try:
-            dati_batch = yf.download(batch, period="3mo", interval="1d", group_by="ticker", progress=False, threads=True)
+            dati_batch = yf.download(batch, period="3mo", interval="1d", group_by="ticker", progress=False, threads=False)
+            time.sleep(1.2)  # Pausa anti-blocco per evitare rate-limit di Yahoo Finance
         except Exception:
+            time.sleep(2.0)
+            continue
+
+        if dati_batch.empty:
             continue
 
         for ticker in batch:
             try:
-                if ticker not in dati_batch.columns.get_level_values(0):
-                    continue
-                df = dati_batch[ticker].dropna(how="all").copy()
+                if isinstance(dati_batch.columns, pd.MultiIndex):
+                    if ticker not in dati_batch.columns.get_level_values(0):
+                        continue
+                    df = dati_batch[ticker].dropna(how="all").copy()
+                else:
+                    df = dati_batch.dropna(how="all").copy()
+
                 if df.empty or len(df) < 35:
                     continue
 
+                scaricati_ok += 1
                 df = calcola_indicatori(df)
                 oggi = df.iloc[-1]
 
@@ -122,20 +139,20 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
                 if pd.isna(rsi) or pd.isna(atr) or pd.isna(vol_avg) or vol_avg == 0:
                     continue
 
+                rel_vol = vol / vol_avg
+
                 if (prezzo >= prezzo_minimo_usd and
                     vol_avg >= volume_minimo and
                     prezzo > ema9 and
-                    50 <= rsi <= 68 and
-                    vol > vol_avg):
+                    rsi_range[0] <= rsi <= rsi_range[1] and
+                    rel_vol >= rel_vol_min):
 
                     stop_loss = prezzo - (moltiplicatore_atr * atr)
                     rischio_per_azione = prezzo - stop_loss
                     if rischio_per_azione <= 0:
                         continue
 
-                    # 1. Azioni consentite dal rischio massimo
                     azioni_da_rischio = int(rischio_usd // rischio_per_azione)
-                    # 2. Azioni consentite dal tetto di allocazione per singolo trade
                     azioni_da_allocazione = int(allocazione_max_usd // prezzo)
                     
                     azioni = min(azioni_da_rischio, azioni_da_allocazione)
@@ -145,11 +162,9 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
                     controvalore_usd = azioni * prezzo
                     rischio_effettivo_usd = azioni * rischio_per_azione
                     
-                    # Take Profit basato sul rapporto R:R rispetto alla distanza dello Stop Loss
                     take_profit = prezzo + (rischio_per_azione * rapporto_rr)
                     profitto_potenziale_usd = azioni * (take_profit - prezzo)
                     var_tp_pct = ((take_profit - prezzo) / prezzo) * 100
-                    rel_vol = vol / vol_avg
 
                     candidati.append({
                         "Ticker": ticker,
@@ -170,13 +185,15 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
 
     barra.empty()
 
-    if not candidati:
-        st.warning("Nessun titolo NYSE soddisfa tutti i criteri con i parametri attuali.")
+    if scaricati_ok == 0:
+        st.error("🚫 Yahoo Finance ha temporaneamente bloccato le richieste dal server cloud (0 titoli scaricati). Attendi 2-3 minuti e riprova.")
+    elif not candidati:
+        st.warning(f"Analizzati **{scaricati_ok}** titoli validi, ma nessuno soddisfa tutti i criteri oggi. Prova ad abbassare il **Volume Relativo Minimo** a `0.8` nella barra laterale.")
     else:
         df_risultati = pd.DataFrame(candidati).sort_values(by="RelVol", ascending=False).reset_index(drop=True)
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Titoli Idonei", len(df_risultati))
+        col1.metric("Titoli Idonei", f"{len(df_risultati)} / {scaricati_ok}")
         col2.metric("Tetto per Trade", f"€ {capitale_eur * allocazione_max_pct:,.2f}")
         col3.metric("Rischio Max Teorico", f"€ {capitale_eur * rischio_max_pct:,.2f}")
         col4.metric("R:R Impostato", f"1 : {rapporto_rr:.1f}")
