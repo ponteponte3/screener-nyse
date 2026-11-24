@@ -33,7 +33,8 @@ st.sidebar.header("⚙️ Parametri Operativi")
 
 capitale_eur = st.sidebar.number_input("Capitale Totale (€)", min_value=500.0, value=10000.0, step=500.0)
 rischio_max_pct = st.sidebar.slider("Rischio Max per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5) / 100
-target_cap_pct = st.sidebar.slider("Target Profitto sul Capitale (%)", min_value=1.0, max_value=10.0, value=4.0, step=0.5) / 100
+allocazione_max_pct = st.sidebar.slider("Allocazione Max per Trade (%)", min_value=5.0, max_value=100.0, value=20.0, step=5.0) / 100
+rapporto_rr = st.sidebar.slider("Rapporto Rischio/Rendimento (R:R)", min_value=1.0, max_value=4.0, value=2.0, step=0.5)
 moltiplicatore_atr = st.sidebar.slider("Moltiplicatore ATR (Stop Loss)", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
 
 st.sidebar.divider()
@@ -69,7 +70,11 @@ def calcola_indicatori(df):
 
 try:
     tickers, nomi_aziende = carica_tickers()
-    st.info(f"📋 Listino caricato: **{len(tickers)}** azioni ordinarie NYSE pronte per lo screening. | Cambio attivo: **1 € = {cambio_eur_usd:.4f} $**")
+    st.info(
+        f"📋 Listino: **{len(tickers)}** titoli NYSE | "
+        f"Max per singolo trade: **€{capitale_eur * allocazione_max_pct:,.2f}** ({allocazione_max_pct*100:.0f}%) | "
+        f"Cambio: **1 € = {cambio_eur_usd:.4f} $**"
+    )
 except FileNotFoundError:
     st.error("⚠️ File `nyse-listed.csv` non trovato. Caricalo nella stessa cartella di `app.py` su GitHub.")
     st.stop()
@@ -79,10 +84,9 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
     candidati = []
     capitale_usd = capitale_eur * cambio_eur_usd
     rischio_usd = capitale_usd * rischio_max_pct
-    target_usd = capitale_usd * target_cap_pct
+    allocazione_max_usd = capitale_usd * allocazione_max_pct
 
     barra = st.progress(0, text="Inizializzazione scansione...")
-    stato_testo = st.empty()
     
     batch_size = 100
     totale = len(tickers)
@@ -129,18 +133,21 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
                     if rischio_per_azione <= 0:
                         continue
 
-                    azioni = int(rischio_usd // rischio_per_azione)
-                    controvalore_usd = azioni * prezzo
-
-                    if controvalore_usd > capitale_usd:
-                        azioni = int(capitale_usd // prezzo)
-                        controvalore_usd = azioni * prezzo
-
+                    # 1. Azioni consentite dal rischio massimo
+                    azioni_da_rischio = int(rischio_usd // rischio_per_azione)
+                    # 2. Azioni consentite dal tetto di allocazione per singolo trade
+                    azioni_da_allocazione = int(allocazione_max_usd // prezzo)
+                    
+                    azioni = min(azioni_da_rischio, azioni_da_allocazione)
                     if azioni < 1:
                         continue
 
+                    controvalore_usd = azioni * prezzo
                     rischio_effettivo_usd = azioni * rischio_per_azione
-                    take_profit = prezzo + (target_usd / azioni)
+                    
+                    # Take Profit basato sul rapporto R:R rispetto alla distanza dello Stop Loss
+                    take_profit = prezzo + (rischio_per_azione * rapporto_rr)
+                    profitto_potenziale_usd = azioni * (take_profit - prezzo)
                     var_tp_pct = ((take_profit - prezzo) / prezzo) * 100
                     rel_vol = vol / vol_avg
 
@@ -155,23 +162,24 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
                         "Stop Loss (€)": round(stop_loss / cambio_eur_usd, 2),
                         "Take Profit (€)": round(take_profit / cambio_eur_usd, 2),
                         "Target (%)": round(var_tp_pct, 1),
-                        "Rischio Max (€)": round(rischio_effettivo_usd / cambio_eur_usd, 2)
+                        "Rischio (€)": round(rischio_effettivo_usd / cambio_eur_usd, 2),
+                        "Profitto Est. (€)": round(profitto_potenziale_usd / cambio_eur_usd, 2)
                     })
             except Exception:
                 continue
 
     barra.empty()
-    stato_testo.empty()
 
     if not candidati:
         st.warning("Nessun titolo NYSE soddisfa tutti i criteri con i parametri attuali.")
     else:
         df_risultati = pd.DataFrame(candidati).sort_values(by="RelVol", ascending=False).reset_index(drop=True)
         
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Titoli Idonei Trovati", len(df_risultati))
-        col2.metric("Rischio Max Impostato", f"€ {capitale_eur * rischio_max_pct:,.2f}")
-        col3.metric("Target Profitto Impostato", f"€ {capitale_eur * target_cap_pct:,.2f}")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Titoli Idonei", len(df_risultati))
+        col2.metric("Tetto per Trade", f"€ {capitale_eur * allocazione_max_pct:,.2f}")
+        col3.metric("Rischio Max Teorico", f"€ {capitale_eur * rischio_max_pct:,.2f}")
+        col4.metric("R:R Impostato", f"1 : {rapporto_rr:.1f}")
 
         st.subheader("🎯 Migliori Opportunità (ordinate per Volume Relativo)")
         st.dataframe(df_risultati, use_container_width=True, hide_index=True)
