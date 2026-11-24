@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 st.title("📈 AlphaPulse — Screener NYSE (EUR)")
-st.markdown("Strategia **Long Trend & Momentum** (`Prezzo > EMA9`, `RSI`, `Volume`) con gestione automatica del rischio e conversione in Euro.")
+st.markdown("Strategia **Long Trend & Momentum** (`Prezzo > EMA9`, `RSI`, `Volume`) con gestione del rischio e conversione in Euro.")
 
 # --- RECUPERO CAMBIO EUR/USD LIVE ---
 @st.cache_data(ttl=3600)
@@ -31,7 +31,6 @@ cambio_default = get_cambio_live()
 
 # --- BARRA LATERALE (PARAMETRI INTERATTIVI) ---
 st.sidebar.header("⚙️ Parametri Operativi")
-
 capitale_eur = st.sidebar.number_input("Capitale Totale (€)", min_value=500.0, value=10000.0, step=500.0)
 rischio_max_pct = st.sidebar.slider("Rischio Max per Trade (%)", min_value=0.5, max_value=5.0, value=2.0, step=0.5) / 100
 allocazione_max_pct = st.sidebar.slider("Allocazione Max per Trade (%)", min_value=5.0, max_value=100.0, value=20.0, step=5.0) / 100
@@ -55,7 +54,7 @@ def carica_tickers(percorso_csv="nyse-listed.csv"):
     nomi_dict = dict(zip(df_csv["ACT Symbol"].str.strip(), df_csv["Company Name"].str.strip()))
     return simboli_puliti, nomi_dict
 
-def calcola_indicatori(df):
+def calcola_metriche_base(df):
     df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
     delta = df['Close'].diff()
     gain = delta.clip(lower=0).rolling(window=14).mean()
@@ -69,45 +68,40 @@ def calcola_indicatori(df):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(window=14).mean()
     df['Vol_Avg30'] = df['Volume'].rolling(window=30).mean()
-    return df
+    return df.iloc[-1]
 
 try:
     tickers, nomi_aziende = carica_tickers()
-    st.info(
-        f"📋 Listino: **{len(tickers)}** titoli NYSE | "
-        f"Max per singolo trade: **€{capitale_eur * allocazione_max_pct:,.2f}** ({allocazione_max_pct*100:.0f}%) | "
-        f"Cambio: **1 € = {cambio_eur_usd:.4f} $**"
-    )
 except FileNotFoundError:
-    st.error("⚠️ File `nyse-listed.csv` non trovato. Caricalo nella stessa cartella di `app.py` su GitHub.")
+    st.error("⚠️ File `nyse-listed.csv` non trovato.")
     st.stop()
 
-# --- AVVIO SCANSIONE ---
-if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container_width=True):
-    candidati = []
-    scaricati_ok = 0
-    capitale_usd = capitale_eur * cambio_eur_usd
-    rischio_usd = capitale_usd * rischio_max_pct
-    allocazione_max_usd = capitale_usd * allocazione_max_pct
+if "dati_mercato" not in st.session_state:
+    st.session_state.dati_mercato = []
 
-    barra = st.progress(0, text="Inizializzazione scansione...")
-    
-    batch_size = 50
+col_btn1, col_btn2 = st.columns([3, 1])
+with col_btn1:
+    avvia_download = st.button("🚀 Scarica / Aggiorna Dati NYSE", type="primary", use_container_width=True)
+with col_btn2:
+    if st.session_state.dati_mercato:
+        st.success(f"Dati in memoria: {len(st.session_state.dati_mercato)} titoli")
+
+if avvia_download:
+    dati_raccolti = []
+    barra = st.progress(0, text="Download dati in corso...")
+    batch_size = 80
     totale = len(tickers)
 
     for i in range(0, totale, batch_size):
         batch = tickers[i:i + batch_size]
         progresso = min((i + batch_size) / totale, 1.0)
-        barra.progress(
-            progresso,
-            text=f"Analisi: {min(i + batch_size, totale)}/{totale} | Scaricati validi: {scaricati_ok} | Trovati: {len(candidati)}"
-        )
+        barra.progress(progresso, text=f"Scaricati {len(dati_raccolti)} titoli validi su {min(i + batch_size, totale)}/{totale} analizzati...")
 
         try:
-            dati_batch = yf.download(batch, period="3mo", interval="1d", group_by="ticker", progress=False, threads=False)
-            time.sleep(1.2)  # Pausa anti-blocco per evitare rate-limit di Yahoo Finance
+            dati_batch = yf.download(batch, period="2mo", interval="1d", group_by="ticker", progress=False, threads=True)
+            time.sleep(0.8)
         except Exception:
-            time.sleep(2.0)
+            time.sleep(1.5)
             continue
 
         if dati_batch.empty:
@@ -122,13 +116,10 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
                 else:
                     df = dati_batch.dropna(how="all").copy()
 
-                if df.empty or len(df) < 35:
+                if df.empty or len(df) < 32:
                     continue
 
-                scaricati_ok += 1
-                df = calcola_indicatori(df)
-                oggi = df.iloc[-1]
-
+                oggi = calcola_metriche_base(df)
                 prezzo  = float(oggi['Close'])
                 ema9    = float(oggi['EMA9'])
                 rsi     = float(oggi['RSI'])
@@ -136,69 +127,92 @@ if st.button("🚀 Avvia Scansione Completa NYSE", type="primary", use_container
                 vol     = float(oggi['Volume'])
                 vol_avg = float(oggi['Vol_Avg30'])
 
-                if pd.isna(rsi) or pd.isna(atr) or pd.isna(vol_avg) or vol_avg == 0:
+                if any(pd.isna(x) for x in [prezzo, ema9, rsi, atr, vol, vol_avg]) or vol_avg == 0:
                     continue
 
-                rel_vol = vol / vol_avg
-
-                if (prezzo >= prezzo_minimo_usd and
-                    vol_avg >= volume_minimo and
-                    prezzo > ema9 and
-                    rsi_range[0] <= rsi <= rsi_range[1] and
-                    rel_vol >= rel_vol_min):
-
-                    stop_loss = prezzo - (moltiplicatore_atr * atr)
-                    rischio_per_azione = prezzo - stop_loss
-                    if rischio_per_azione <= 0:
-                        continue
-
-                    azioni_da_rischio = int(rischio_usd // rischio_per_azione)
-                    azioni_da_allocazione = int(allocazione_max_usd // prezzo)
-                    
-                    azioni = min(azioni_da_rischio, azioni_da_allocazione)
-                    if azioni < 1:
-                        continue
-
-                    controvalore_usd = azioni * prezzo
-                    rischio_effettivo_usd = azioni * rischio_per_azione
-                    
-                    take_profit = prezzo + (rischio_per_azione * rapporto_rr)
-                    profitto_potenziale_usd = azioni * (take_profit - prezzo)
-                    var_tp_pct = ((take_profit - prezzo) / prezzo) * 100
-
-                    candidati.append({
-                        "Ticker": ticker,
-                        "Azienda": nomi_aziende.get(ticker, "")[:35],
-                        "Prezzo (€)": round(prezzo / cambio_eur_usd, 2),
-                        "RSI": round(rsi, 1),
-                        "RelVol": round(rel_vol, 2),
-                        "Azioni": azioni,
-                        "Investito (€)": round(controvalore_usd / cambio_eur_usd, 2),
-                        "Stop Loss (€)": round(stop_loss / cambio_eur_usd, 2),
-                        "Take Profit (€)": round(take_profit / cambio_eur_usd, 2),
-                        "Target (%)": round(var_tp_pct, 1),
-                        "Rischio (€)": round(rischio_effettivo_usd / cambio_eur_usd, 2),
-                        "Profitto Est. (€)": round(profitto_potenziale_usd / cambio_eur_usd, 2)
-                    })
+                dati_raccolti.append({
+                    "Ticker": ticker,
+                    "Azienda": nomi_aziende.get(ticker, "")[:35],
+                    "Prezzo": prezzo,
+                    "EMA9": ema9,
+                    "RSI": rsi,
+                    "ATR": atr,
+                    "Vol": vol,
+                    "Vol_Avg30": vol_avg,
+                    "RelVol": vol / vol_avg
+                })
             except Exception:
                 continue
 
     barra.empty()
+    st.session_state.dati_mercato = dati_raccolti
+    if len(dati_raccolti) == 0:
+        st.error("🚫 Yahoo Finance non ha restituito dati (possibile blocco temporaneo sull'IP del server). Attendi 2 minuti e riprova.")
 
-    if scaricati_ok == 0:
-        st.error("🚫 Yahoo Finance ha temporaneamente bloccato le richieste dal server cloud (0 titoli scaricati). Attendi 2-3 minuti e riprova.")
-    elif not candidati:
-        st.warning(f"Analizzati **{scaricati_ok}** titoli validi, ma nessuno soddisfa tutti i criteri oggi. Prova ad abbassare il **Volume Relativo Minimo** a `0.8` nella barra laterale.")
+# --- FILTRAGGIO ISTANTANEO SUI DATI IN MEMORIA ---
+if st.session_state.dati_mercato:
+    df_all = pd.DataFrame(st.session_state.dati_mercato)
+    
+    # Diagnostica passo-passo
+    step1 = df_all[(df_all["Prezzo"] >= prezzo_minimo_usd) & (df_all["Vol_Avg30"] >= volume_minimo)]
+    step2 = step1[step1["Prezzo"] > step1["EMA9"]]
+    step3 = step2[(step2["RSI"] >= rsi_range[0]) & (step2["RSI"] <= rsi_range[1])]
+    step4 = step3[step3["RelVol"] >= rel_vol_min]
+
+    with st.expander("📊 Diagnostica Filtri (quanti titoli superano ogni passaggio)", expanded=True):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("1. Scaricati OK", len(df_all))
+        c2.metric("2. Prezzo & Liq.", len(step1))
+        c3.metric("3. Prezzo > EMA9", len(step2))
+        c4.metric("4. Range RSI", len(step3))
+        c5.metric("5. RelVol Min", len(step4))
+
+    candidati = []
+    capitale_usd = capitale_eur * cambio_eur_usd
+    rischio_usd = capitale_usd * rischio_max_pct
+    allocazione_max_usd = capitale_usd * allocazione_max_pct
+
+    for _, row in step4.iterrows():
+        prezzo = row["Prezzo"]
+        atr = row["ATR"]
+        stop_loss = prezzo - (moltiplicatore_atr * atr)
+        rischio_per_azione = prezzo - stop_loss
+        if rischio_per_azione <= 0:
+            continue
+
+        azioni_da_rischio = int(rischio_usd // rischio_per_azione)
+        azioni_da_allocazione = int(allocazione_max_usd // prezzo)
+        azioni = min(azioni_da_rischio, azioni_da_allocazione)
+
+        if azioni < 1:
+            continue
+
+        controvalore_usd = azioni * prezzo
+        rischio_effettivo_usd = azioni * rischio_per_azione
+        take_profit = prezzo + (rischio_per_azione * rapporto_rr)
+        profitto_potenziale_usd = azioni * (take_profit - prezzo)
+        var_tp_pct = ((take_profit - prezzo) / prezzo) * 100
+
+        candidati.append({
+            "Ticker": row["Ticker"],
+            "Azienda": row["Azienda"],
+            "Prezzo (€)": round(prezzo / cambio_eur_usd, 2),
+            "RSI": round(row["RSI"], 1),
+            "RelVol": round(row["RelVol"], 2),
+            "Azioni": azioni,
+            "Investito (€)": round(controvalore_usd / cambio_eur_usd, 2),
+            "Stop Loss (€)": round(stop_loss / cambio_eur_usd, 2),
+            "Take Profit (€)": round(take_profit / cambio_eur_usd, 2),
+            "Target (%)": round(var_tp_pct, 1),
+            "Rischio (€)": round(rischio_effettivo_usd / cambio_eur_usd, 2),
+            "Profitto Est. (€)": round(profitto_potenziale_usd / cambio_eur_usd, 2)
+        })
+
+    if not candidati:
+        st.warning("Nessun titolo supera tutti i filtri con queste impostazioni. Guarda la barra **Diagnostica Filtri** qui sopra per vedere quale filtro azzera i risultati e regolalo nella barra laterale.")
     else:
         df_risultati = pd.DataFrame(candidati).sort_values(by="RelVol", ascending=False).reset_index(drop=True)
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Titoli Idonei", f"{len(df_risultati)} / {scaricati_ok}")
-        col2.metric("Tetto per Trade", f"€ {capitale_eur * allocazione_max_pct:,.2f}")
-        col3.metric("Rischio Max Teorico", f"€ {capitale_eur * rischio_max_pct:,.2f}")
-        col4.metric("R:R Impostato", f"1 : {rapporto_rr:.1f}")
-
-        st.subheader("🎯 Migliori Opportunità (ordinate per Volume Relativo)")
+        st.subheader(f"🎯 {len(df_risultati)} Opportunità Trovate (ordinate per Volume Relativo)")
         st.dataframe(df_risultati, use_container_width=True, hide_index=True)
 
         csv_export = df_risultati.to_csv(index=False).encode('utf-8')
