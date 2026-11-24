@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import time
+from datetime import datetime
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
@@ -11,8 +12,8 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📈 AlphaPulse — Screener NYSE (EUR)")
-st.markdown("Strategia **Long Trend & Momentum** (`Prezzo > EMA9`, `RSI`, `Volume`) con gestione del rischio e conversione in Euro.")
+st.title("📈 AlphaPulse — Screener Tecnico & Fondamentale NYSE (EUR)")
+st.markdown("1. **Filtro Tecnico:** `Prezzo > EMA9`, `RSI`, `Volume` + Position Sizing in Euro.\n2. **Filtro Fondamentale:** Analisi su richiesta dei candidati (Multipli, Crescita, Debito, Trimestrali).")
 
 # --- RECUPERO CAMBIO EUR/USD LIVE ---
 @st.cache_data(ttl=3600)
@@ -38,7 +39,7 @@ rapporto_rr = st.sidebar.slider("Rapporto Rischio/Rendimento (R:R)", min_value=1
 moltiplicatore_atr = st.sidebar.slider("Moltiplicatore ATR (Stop Loss)", min_value=1.0, max_value=3.0, value=1.5, step=0.1)
 
 st.sidebar.divider()
-st.sidebar.subheader("🔍 Filtri Strategia & Liquidità")
+st.sidebar.subheader("🔍 Filtri Tecnici & Liquidità")
 rsi_range = st.sidebar.slider("Range RSI (14g)", min_value=30, max_value=80, value=(50, 68))
 rel_vol_min = st.sidebar.slider("Volume Relativo Minimo (vs Media 30g)", min_value=0.5, max_value=2.0, value=1.0, step=0.1)
 prezzo_minimo_usd = st.sidebar.number_input("Prezzo Minimo Titolo ($)", min_value=1.0, value=5.0, step=1.0)
@@ -70,6 +71,42 @@ def calcola_metriche_base(df):
     df['Vol_Avg30'] = df['Volume'].rolling(window=30).mean()
     return df.iloc[-1]
 
+@st.cache_data(ttl=3600)
+def scarica_fondamentali_singolo(ticker):
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        
+        mcap = info.get("marketCap")
+        mcap_b = round(mcap / 1e9, 2) if mcap else None
+        
+        pe_trailing = info.get("trailingPE")
+        pe_forward = info.get("forwardPE")
+        rev_growth = info.get("revenueGrowth")
+        op_margin = info.get("operatingMargins")
+        roe = info.get("returnOnEquity")
+        debt_eq = info.get("debtToEquity")
+        settore = info.get("sector", "N/D")
+        
+        # Data prossimi utili (timestamp unix in secondi)
+        earnings_ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
+        earnings_str = datetime.fromtimestamp(earnings_ts).strftime("%d/%m/%Y") if earnings_ts else "N/D"
+
+        return {
+            "Ticker": ticker,
+            "Settore": settore,
+            "Cap. (Mld $)": mcap_b,
+            "P/E Attuale": round(pe_trailing, 1) if pe_trailing else None,
+            "P/E Stimato": round(pe_forward, 1) if pe_forward else None,
+            "Crescita Ricavi (%)": round(rev_growth * 100, 1) if rev_growth is not None else None,
+            "Margine Op. (%)": round(op_margin * 100, 1) if op_margin is not None else None,
+            "ROE (%)": round(roe * 100, 1) if roe is not None else None,
+            "Debito/Patr. (%)": round(debt_eq, 1) if debt_eq is not None else None,
+            "Prossimi Utili": earnings_str
+        }
+    except Exception:
+        return {"Ticker": ticker, "Settore": "Errore recupero dati"}
+
 try:
     tickers, nomi_aziende = carica_tickers()
 except FileNotFoundError:
@@ -81,21 +118,21 @@ if "dati_mercato" not in st.session_state:
 
 col_btn1, col_btn2 = st.columns([3, 1])
 with col_btn1:
-    avvia_download = st.button("🚀 Scarica / Aggiorna Dati NYSE", type="primary", use_container_width=True)
+    avvia_download = st.button("🚀 1. Scarica / Aggiorna Dati Tecnici NYSE", type="primary", use_container_width=True)
 with col_btn2:
     if st.session_state.dati_mercato:
-        st.success(f"Dati in memoria: {len(st.session_state.dati_mercato)} titoli")
+        st.success(f"In memoria: {len(st.session_state.dati_mercato)} titoli")
 
 if avvia_download:
     dati_raccolti = []
-    barra = st.progress(0, text="Download dati in corso...")
+    barra = st.progress(0, text="Download dati tecnici in corso...")
     batch_size = 80
     totale = len(tickers)
 
     for i in range(0, totale, batch_size):
         batch = tickers[i:i + batch_size]
         progresso = min((i + batch_size) / totale, 1.0)
-        barra.progress(progresso, text=f"Scaricati {len(dati_raccolti)} titoli validi su {min(i + batch_size, totale)}/{totale} analizzati...")
+        barra.progress(progresso, text=f"Scaricati {len(dati_raccolti)} titoli validi su {min(i + batch_size, totale)}/{totale}...")
 
         try:
             dati_batch = yf.download(batch, period="2mo", interval="1d", group_by="ticker", progress=False, threads=True)
@@ -147,19 +184,18 @@ if avvia_download:
     barra.empty()
     st.session_state.dati_mercato = dati_raccolti
     if len(dati_raccolti) == 0:
-        st.error("🚫 Yahoo Finance non ha restituito dati (possibile blocco temporaneo sull'IP del server). Attendi 2 minuti e riprova.")
+        st.error("🚫 Yahoo Finance non ha restituito dati. Attendi 2 minuti e riprova.")
 
-# --- FILTRAGGIO ISTANTANEO SUI DATI IN MEMORIA ---
+# --- FILTRAGGIO TECNICO E ANALISI FONDAMENTALE ---
 if st.session_state.dati_mercato:
     df_all = pd.DataFrame(st.session_state.dati_mercato)
     
-    # Diagnostica passo-passo
     step1 = df_all[(df_all["Prezzo"] >= prezzo_minimo_usd) & (df_all["Vol_Avg30"] >= volume_minimo)]
     step2 = step1[step1["Prezzo"] > step1["EMA9"]]
     step3 = step2[(step2["RSI"] >= rsi_range[0]) & (step2["RSI"] <= rsi_range[1])]
     step4 = step3[step3["RelVol"] >= rel_vol_min]
 
-    with st.expander("📊 Diagnostica Filtri (quanti titoli superano ogni passaggio)", expanded=True):
+    with st.expander("📊 Diagnostica Filtri Tecnici", expanded=False):
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("1. Scaricati OK", len(df_all))
         c2.metric("2. Prezzo & Liq.", len(step1))
@@ -180,10 +216,7 @@ if st.session_state.dati_mercato:
         if rischio_per_azione <= 0:
             continue
 
-        azioni_da_rischio = int(rischio_usd // rischio_per_azione)
-        azioni_da_allocazione = int(allocazione_max_usd // prezzo)
-        azioni = min(azioni_da_rischio, azioni_da_allocazione)
-
+        azioni = min(int(rischio_usd // rischio_per_azione), int(allocazione_max_usd // prezzo))
         if azioni < 1:
             continue
 
@@ -209,16 +242,36 @@ if st.session_state.dati_mercato:
         })
 
     if not candidati:
-        st.warning("Nessun titolo supera tutti i filtri con queste impostazioni. Guarda la barra **Diagnostica Filtri** qui sopra per vedere quale filtro azzera i risultati e regolalo nella barra laterale.")
+        st.warning("Nessun titolo supera i filtri tecnici con queste impostazioni. Prova ad abbassare il Volume Relativo nella barra laterale.")
     else:
         df_risultati = pd.DataFrame(candidati).sort_values(by="RelVol", ascending=False).reset_index(drop=True)
-        st.subheader(f"🎯 {len(df_risultati)} Opportunità Trovate (ordinate per Volume Relativo)")
+        st.subheader(f"🎯 {len(df_risultati)} Candidati Tecnici (ordinati per Volume Relativo)")
         st.dataframe(df_risultati, use_container_width=True, hide_index=True)
 
-        csv_export = df_risultati.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Scarica risultati in CSV",
-            data=csv_export,
-            file_name="screener_nyse_eur.csv",
-            mime="text/csv"
-        )
+        st.divider()
+        st.subheader("🏢 Analisi Fondamentale dei Candidati")
+        
+        if st.button("🔍 2. Analizza Fondamentali di questi titoli", use_container_width=True):
+            lista_ticker_filtrati = df_risultati["Ticker"].tolist()
+            dati_fond = []
+            prog_fond = st.progress(0, text="Recupero dati di bilancio e trimestrali...")
+            
+            for idx, tk in enumerate(lista_ticker_filtrati, 1):
+                prog_fond.progress(idx / len(lista_ticker_filtrati), text=f"Analisi fondamentale: {tk} ({idx}/{len(lista_ticker_filtrati)})...")
+                dati_fond.append(scarica_fondamentali_singolo(tk))
+                time.sleep(0.3)
+            
+            prog_fond.empty()
+            df_fond = pd.DataFrame(dati_fond)
+            
+            # Unione tabella tecnica + fondamentale
+            df_completo = pd.merge(df_risultati, df_fond, on="Ticker", how="left")
+            st.dataframe(df_completo, use_container_width=True, hide_index=True)
+
+            csv_completo = df_completo.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Scarica Tabella Completa (Tecnica + Fondamentale) in CSV",
+                data=csv_completo,
+                file_name="screener_nyse_completo.csv",
+                mime="text/csv"
+            )
