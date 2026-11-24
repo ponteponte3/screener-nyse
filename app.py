@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("📈 AlphaPulse — Screener Tecnico & Fondamentale NYSE (EUR)")
-st.markdown("1. **Filtro Tecnico:** `Prezzo > EMA9`, `RSI`, `Volume` + Position Sizing in Euro.\n2. **Filtro Fondamentale:** Analisi su richiesta dei candidati (Multipli, Crescita, Debito, Trimestrali).")
+st.markdown("1. **Filtro Tecnico & Score:** `Prezzo > EMA9`, `RSI`, `Volume`, punteggio di qualità `0–100` e Position Sizing in Euro.\n2. **Filtro Fondamentale:** Analisi su richiesta dei candidati (Multipli, Crescita, Debito, Trimestrali).")
 
 # --- RECUPERO CAMBIO EUR/USD LIVE ---
 @st.cache_data(ttl=3600)
@@ -41,7 +41,7 @@ moltiplicatore_atr = st.sidebar.slider("Moltiplicatore ATR (Stop Loss)", min_val
 st.sidebar.divider()
 st.sidebar.subheader("🔍 Filtri Tecnici & Liquidità")
 rsi_range = st.sidebar.slider("Range RSI (14g)", min_value=30, max_value=80, value=(50, 68))
-rel_vol_min = st.sidebar.slider("Volume Relativo Minimo (vs Media 30g)", min_value=0.5, max_value=2.0, value=1.0, step=0.1)
+rel_vol_min = st.sidebar.slider("Volume Relativo Minimo (vs Media 30g)", min_value=0.5, max_value=2.0, value=0.8, step=0.1)
 prezzo_minimo_usd = st.sidebar.number_input("Prezzo Minimo Titolo ($)", min_value=1.0, value=5.0, step=1.0)
 volume_minimo = st.sidebar.number_input("Volume Medio Minimo (30g)", min_value=100000, value=500000, step=100000)
 cambio_eur_usd = st.sidebar.number_input("Tasso Cambio EUR/USD", min_value=0.5000, max_value=2.0000, value=cambio_default, step=0.0050, format="%.4f")
@@ -71,6 +71,37 @@ def calcola_metriche_base(df):
     df['Vol_Avg30'] = df['Volume'].rolling(window=30).mean()
     return df.iloc[-1]
 
+def calcola_score_tecnico(prezzo, ema9, rsi, rel_vol, vol_avg):
+    # 1. Spinta Volumi (max 35 pt)
+    pt_vol = min(max((rel_vol - 0.8) / 1.2 * 35, 5), 35)
+    
+    # 2. Zona ideale RSI 55-63 (max 25 pt)
+    if 55 <= rsi <= 63:
+        pt_rsi = 25
+    elif 50 <= rsi < 55 or 63 < rsi <= 68:
+        pt_rsi = 18
+    else:
+        pt_rsi = 10
+        
+    # 3. Estensione ottimale sopra EMA9 tra +1% e +4% (max 20 pt)
+    dist_ema_pct = ((prezzo - ema9) / ema9) * 100
+    if 1.0 <= dist_ema_pct <= 4.0:
+        pt_ema = 20
+    elif 0 < dist_ema_pct < 1.0:
+        pt_ema = 14
+    else:
+        pt_ema = 10  # Troppo esteso oltre +4%
+        
+    # 4. Liquidità istituzionale (max 20 pt)
+    if vol_avg >= 2000000:
+        pt_liq = 20
+    elif vol_avg >= 1000000:
+        pt_liq = 15
+    else:
+        pt_liq = 10
+        
+    return int(round(pt_vol + pt_rsi + pt_ema + pt_liq))
+
 @st.cache_data(ttl=3600)
 def scarica_fondamentali_singolo(ticker):
     try:
@@ -88,12 +119,28 @@ def scarica_fondamentali_singolo(ticker):
         debt_eq = info.get("debtToEquity")
         settore = info.get("sector", "N/D")
         
-        # Data prossimi utili (timestamp unix in secondi)
         earnings_ts = info.get("earningsTimestamp") or info.get("earningsTimestampStart")
-        earnings_str = datetime.fromtimestamp(earnings_ts).strftime("%d/%m/%Y") if earnings_ts else "N/D"
+        earnings_str = "N/D"
+        giorni_agli_utili = None
+        if earnings_ts:
+            dt_earn = datetime.fromtimestamp(earnings_ts)
+            earnings_str = dt_earn.strftime("%d/%m/%Y")
+            giorni_agli_utili = (dt_earn - datetime.now()).days
+
+        # Bonus/Malus fondamentale (-15 a +15 pt)
+        bonus_fond = 0
+        if rev_growth is not None and rev_growth > 0.05:
+            bonus_fond += 5
+        if op_margin is not None and op_margin > 0.10:
+            bonus_fond += 5
+        if debt_eq is not None and debt_eq < 100:
+            bonus_fond += 5
+        if giorni_agli_utili is not None and 0 <= giorni_agli_utili <= 7:
+            bonus_fond -= 15  # Penalità per trimestrale imminente
 
         return {
             "Ticker": ticker,
+            "BonusFond": bonus_fond,
             "Settore": settore,
             "Cap. (Mld $)": mcap_b,
             "P/E Attuale": round(pe_trailing, 1) if pe_trailing else None,
@@ -105,7 +152,7 @@ def scarica_fondamentali_singolo(ticker):
             "Prossimi Utili": earnings_str
         }
     except Exception:
-        return {"Ticker": ticker, "Settore": "Errore recupero dati"}
+        return {"Ticker": ticker, "BonusFond": 0, "Settore": "Errore recupero dati"}
 
 try:
     tickers, nomi_aziende = carica_tickers()
@@ -225,8 +272,10 @@ if st.session_state.dati_mercato:
         take_profit = prezzo + (rischio_per_azione * rapporto_rr)
         profitto_potenziale_usd = azioni * (take_profit - prezzo)
         var_tp_pct = ((take_profit - prezzo) / prezzo) * 100
+        score_tec = calcola_score_tecnico(prezzo, row["EMA9"], row["RSI"], row["RelVol"], row["Vol_Avg30"])
 
         candidati.append({
+            "Score": score_tec,
             "Ticker": row["Ticker"],
             "Azienda": row["Azienda"],
             "Prezzo (€)": round(prezzo / cambio_eur_usd, 2),
@@ -244,14 +293,14 @@ if st.session_state.dati_mercato:
     if not candidati:
         st.warning("Nessun titolo supera i filtri tecnici con queste impostazioni. Prova ad abbassare il Volume Relativo nella barra laterale.")
     else:
-        df_risultati = pd.DataFrame(candidati).sort_values(by="RelVol", ascending=False).reset_index(drop=True)
-        st.subheader(f"🎯 {len(df_risultati)} Candidati Tecnici (ordinati per Volume Relativo)")
+        df_risultati = pd.DataFrame(candidati).sort_values(by=["Score", "RelVol"], ascending=[False, False]).reset_index(drop=True)
+        st.subheader(f"🎯 {len(df_risultati)} Candidati Tecnici (ordinati per Score di Qualità)")
         st.dataframe(df_risultati, use_container_width=True, hide_index=True)
 
         st.divider()
         st.subheader("🏢 Analisi Fondamentale dei Candidati")
         
-        if st.button("🔍 2. Analizza Fondamentali di questi titoli", use_container_width=True):
+        if st.button("🔍 2. Analizza Fondamentali e Aggiorna Score", use_container_width=True):
             lista_ticker_filtrati = df_risultati["Ticker"].tolist()
             dati_fond = []
             prog_fond = st.progress(0, text="Recupero dati di bilancio e trimestrali...")
@@ -264,8 +313,10 @@ if st.session_state.dati_mercato:
             prog_fond.empty()
             df_fond = pd.DataFrame(dati_fond)
             
-            # Unione tabella tecnica + fondamentale
             df_completo = pd.merge(df_risultati, df_fond, on="Ticker", how="left")
+            df_completo["Score"] = (df_completo["Score"] + df_completo["BonusFond"].fillna(0)).clip(0, 100).astype(int)
+            df_completo = df_completo.drop(columns=["BonusFond"]).sort_values(by=["Score", "RelVol"], ascending=[False, False]).reset_index(drop=True)
+            
             st.dataframe(df_completo, use_container_width=True, hide_index=True)
 
             csv_completo = df_completo.to_csv(index=False).encode('utf-8')
